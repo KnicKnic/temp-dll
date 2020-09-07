@@ -1,18 +1,19 @@
 package tempdll
 
 import (
-	"fmt"
+	"bytes"
+	"crypto/sha256"
+	"encoding/base32"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
-
-	"github.com/google/uuid"
 )
 
 // A LazyDLL implements access to a single DLL.
@@ -20,13 +21,13 @@ import (
 // call to its Handle method or to one of its
 // LazyProc's Addr method.
 type LazyDLL struct {
-	mu       sync.Mutex
-	dll      *syscall.DLL // non nil once DLL is loaded
-	Name     string
-	fileName string // tempfolder + prefix + Name is the dll name to write
+	mu   sync.Mutex
+	dll  *syscall.DLL // non nil once DLL is loaded
+	Name string
 
 	wroteDll  bool
-	dllHandle *syscall.Handle
+	dllHandle *os.File // a readonly fileHandle to block writes
+	fileName  string   // the full path to the dll that is created
 	dllData   io.Reader
 }
 
@@ -69,6 +70,8 @@ func OpenWithDelete(fileName string) *syscall.Handle {
 	return handle
 }
 
+var fileNameSafeEncoder = base32.StdEncoding.WithPadding(base32.NoPadding)
+
 // Load loads DLL file d.Name into memory. It returns an error if fails.
 // Load will not try to load DLL, if it is already loaded into memory.
 func (d *LazyDLL) Load() error {
@@ -79,18 +82,21 @@ func (d *LazyDLL) Load() error {
 		defer d.mu.Unlock()
 		if d.dll == nil {
 			if !d.wroteDll {
-				e := copyFile(d.fileName, d.dllData)
+
+				contents := bytes.NewBuffer(nil)
+				_, e := io.Copy(contents, d.dllData)
 				if e != nil {
 					return e
 				}
 
-				fmt.Print("Created file ", d.fileName)
+				sha := sha256.Sum256(contents.Bytes())
+				shaFileName := fileNameSafeEncoder.EncodeToString(sha[:])
+				d.fileName = filepath.Join(os.TempDir(), (shaFileName + "-" + d.Name))
 
-				d.dllHandle, e = openWithDelete(d.fileName)
+				d.dllHandle, e = safeWriteFile(d.fileName, contents.Bytes(), 60, time.Second)
 				if e != nil {
 					return e
 				}
-				// syscall.CloseHandle(*d.dllHandle)
 
 				d.wroteDll = true
 			}
@@ -122,9 +128,7 @@ func (d *LazyDLL) Handle() uintptr {
 
 // NewLazyDLL creates new LazyDLL associated with DLL file.
 func NewLazyDLL(dll io.Reader, name string) *LazyDLL {
-	prefix := uuid.New().String()
-	tempFileName := filepath.Join(os.TempDir(), (prefix + name))
-	return &LazyDLL{fileName: tempFileName, Name: name, dllData: dll}
+	return &LazyDLL{Name: name, dllData: dll}
 }
 
 // A LazyProc implements access to a procedure inside a LazyDLL.
